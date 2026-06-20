@@ -114,11 +114,35 @@ export default function App() {
     setErrorMessage(null);
     setInterimText('');
 
+    // Check if device is iOS or iPadOS (including new Safari on iPads)
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
     try {
-      // 1. Warm up audio context and state mic stream for analyzer drawing
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
-      if (stream) {
-        setMediaStream(stream);
+      if (isIOS) {
+        // On iOS / Safari, we MUST request getUserMedia first to trigger the native browser permission prompt.
+        // We then immediately stop the tracks to release the mic device so that webkitSpeechRecognition can access it.
+        try {
+          const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          if (tempStream) {
+            tempStream.getTracks().forEach(track => track.stop());
+          }
+        } catch (e) {
+          console.error('iOS getUserMedia permission request failed or denied:', e);
+          setErrorMessage('මයික්‍රෆෝනය භාවිතයට අවසර ලබා ගැනීමට නොහැකි විය. කරුණාකර බ්‍රවුසර සැකසුම් පරීක්‍ෂා කරන්න. (Failed to acquire microphone permission on iOS. Please check your browser settings.)');
+          setMicState('error');
+          return;
+        }
+      } else {
+        // 1. On non-iOS devices, warm up audio context for real-time visualization drawing
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
+          if (stream) {
+            setMediaStream(stream);
+          }
+        } catch (e) {
+          console.warn('Microphone stream warmup skipped or blocked:', e);
+        }
       }
 
       // 2. Initialize recognition
@@ -167,11 +191,11 @@ export default function App() {
           setInterimText(interimBatch);
         }
 
-        // Auto Stop & Copy: Stop mic exactly 2 seconds AFTER voice stops completely
+        // Auto Stop & Copy: Stop mic exactly 1 second AFTER voice stops completely
         if (autoStopAndCopy && (latestTextRef.current.trim() || interimBatch.trim())) {
           silenceTimeoutRef.current = setTimeout(() => {
             stopListening();
-          }, 2000);
+          }, 1000);
         }
       };
 
