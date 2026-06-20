@@ -1,0 +1,6 @@
+{
+  "name": "Sinhala Voice Typing",
+  "description": "A clean, efficient tool for speech-to-text voice typing in Sinhala with real-time editing, local history, and sharing capabilities.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
