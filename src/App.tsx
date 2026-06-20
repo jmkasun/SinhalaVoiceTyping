@@ -119,21 +119,7 @@ export default function App() {
       (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
     try {
-      if (isIOS) {
-        // On iOS / Safari, we MUST request getUserMedia first to trigger the native browser permission prompt.
-        // We then immediately stop the tracks to release the mic device so that webkitSpeechRecognition can access it.
-        try {
-          const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          if (tempStream) {
-            tempStream.getTracks().forEach(track => track.stop());
-          }
-        } catch (e) {
-          console.error('iOS getUserMedia permission request failed or denied:', e);
-          setErrorMessage('මයික්‍රෆෝනය භාවිතයට අවසර ලබා ගැනීමට නොහැකි විය. කරුණාකර බ්‍රවුසර සැකසුම් පරීක්‍ෂා කරන්න. (Failed to acquire microphone permission on iOS. Please check your browser settings.)');
-          setMicState('error');
-          return;
-        }
-      } else {
+      if (!isIOS) {
         // 1. On non-iOS devices, warm up audio context for real-time visualization drawing
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
@@ -145,7 +131,7 @@ export default function App() {
         }
       }
 
-      // 2. Initialize recognition
+      // 2. Initialize recognition. We MUST not await any promise prior to this on iOS as it loses the synchronous user-gesture tracking context, triggering "service-not-allowed".
       const rec = new SpeechRecognition();
       rec.lang = 'si-LK'; // Default standard Sinhala language parameter
       rec.continuous = true; // Run continuously so browser doesn't cut off immediately
