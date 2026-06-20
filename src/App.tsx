@@ -69,6 +69,13 @@ export default function App() {
   // Web Audio analyser stream
   const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
 
+  // New AI Dictation specific states & refs
+  const [dictationMode, setDictationMode] = useState<'web' | 'ai'>('web');
+  const [isRecordingAi, setIsRecordingAi] = useState<boolean>(false);
+  const [aiTranscribingStatus, setAiTranscribingStatus] = useState<boolean>(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const aiChunksRef = useRef<Blob[]>([]);
+
   // References
   const recognitionRef = useRef<any>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -108,30 +115,20 @@ export default function App() {
     return () => clearInterval(timer);
   }, [isListening]);
 
-  // Audio stream and recognition control
-  const startListening = async () => {
-    if (!isSpeechSupported) return;
-    setErrorMessage(null);
-    setInterimText('');
-
-    // Check if device is iOS or iPadOS (including new Safari on iPads)
-    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || 
-      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-
+  // Audio stream and recognition control for non-iOS platforms
+  const startListeningNonIOS = async () => {
     try {
-      if (!isIOS) {
-        // 1. On non-iOS devices, warm up audio context for real-time visualization drawing
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
-          if (stream) {
-            setMediaStream(stream);
-          }
-        } catch (e) {
-          console.warn('Microphone stream warmup skipped or blocked:', e);
+      // 1. On non-iOS devices, warm up audio context for real-time visualization drawing
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
+        if (stream) {
+          setMediaStream(stream);
         }
+      } catch (e) {
+        console.warn('Microphone stream warmup skipped or blocked:', e);
       }
 
-      // 2. Initialize recognition. We MUST not await any promise prior to this on iOS as it loses the synchronous user-gesture tracking context, triggering "service-not-allowed".
+      // 2. Initialize recognition
       const rec = new SpeechRecognition();
       rec.lang = 'si-LK'; // Default standard Sinhala language parameter
       rec.continuous = true; // Run continuously so browser doesn't cut off immediately
@@ -237,7 +234,255 @@ export default function App() {
     }
   };
 
+  const startListening = () => {
+    if (!isSpeechSupported) return;
+    setErrorMessage(null);
+    setInterimText('');
+
+    // Check if device is iOS or iPadOS (including new Safari on iPads)
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+    if (isIOS) {
+      // 100% Synchronous initialization path for iOS Safari to satisfy the strict user-gesture context.
+      // This prevents the dreaded "service-not-allowed" security error!
+      try {
+        const rec = new SpeechRecognition();
+        rec.lang = 'si-LK';
+        rec.continuous = false; // continuous = false is MUCH more stable on iOS safari!
+        rec.interimResults = true;
+
+        rec.onstart = () => {
+          setIsListening(true);
+          setMicState('listening');
+          if (silenceTimeoutRef.current) {
+            clearTimeout(silenceTimeoutRef.current);
+            silenceTimeoutRef.current = null;
+          }
+        };
+
+        rec.onresult = (event: any) => {
+          if (silenceTimeoutRef.current) {
+            clearTimeout(silenceTimeoutRef.current);
+            silenceTimeoutRef.current = null;
+          }
+
+          let finalBatch = '';
+          let interimBatch = '';
+
+          for (let i = event.resultIndex; i < event.results.length; ++i) {
+            const result = event.results[i];
+            if (result.isFinal) {
+              finalBatch += result[0].transcript;
+            } else {
+              interimBatch += result[0].transcript;
+            }
+          }
+
+          if (finalBatch) {
+            setMainText(prev => {
+              const separator = prev && !prev.endsWith(' ') ? ' ' : '';
+              const nextText = prev + separator + finalBatch;
+              latestTextRef.current = nextText;
+              return nextText;
+            });
+            setInterimText('');
+          } else {
+            setInterimText(interimBatch);
+          }
+
+          if (autoStopAndCopy && (latestTextRef.current.trim() || interimBatch.trim())) {
+            silenceTimeoutRef.current = setTimeout(() => {
+              stopListening();
+            }, 1000);
+          }
+        };
+
+        rec.onerror = (e: any) => {
+          console.error('Speech recognition error event (iOS native):', e);
+          if (silenceTimeoutRef.current) {
+            clearTimeout(silenceTimeoutRef.current);
+            silenceTimeoutRef.current = null;
+          }
+          if (e.error === 'not-allowed') {
+            setErrorMessage('මයික්‍රෆෝනය භාවිතයට අවසර දී නැත. කරුණාකර settings තුලින් අවසර ලබාදෙන්න. (Microphone access blocked. Please unlock browser mic permissions.)');
+          } else if (e.error === 'service-not-allowed') {
+            setErrorMessage('iOS Safari සීමාවක් නිසා හඬ හඳුනාගැනීම ක්‍රියා නොකරයි. කරුණාකර Settings -> General -> Keyboard වෙත ගොස් "Enable Dictation" සක්‍රීය කර ඇති බව තහවුරු කරන්න. (iOS Safari Web Speech limit. Please ensure "Enable Dictation" is enabled under Settings -> General -> Keyboard.)');
+          } else if (e.error === 'no-speech') {
+            // Normal timeout if nothing spoken, non-blocking
+          } else {
+            setErrorMessage(`දෝෂයක් සිදු විය: ${e.error || 'Unknown transcript failure'}`);
+          }
+          setMicState('error');
+          stopListening();
+        };
+
+        rec.onend = () => {
+          if (silenceTimeoutRef.current) {
+            clearTimeout(silenceTimeoutRef.current);
+            silenceTimeoutRef.current = null;
+          }
+          setIsListening(false);
+          setMicState(prev => prev === 'error' ? 'error' : 'idle');
+          
+          if (autoStopAndCopy && latestTextRef.current.trim()) {
+            navigator.clipboard.writeText(latestTextRef.current.trim())
+              .then(() => {
+                setCopyStatus(true);
+                setTimeout(() => setCopyStatus(false), 2500);
+              })
+              .catch(err => console.warn('Auto-clipboard copy blocked or failed:', err));
+          }
+        };
+
+        recognitionRef.current = rec;
+        rec.start();
+      } catch (err: any) {
+        console.error('Failed to initialize iOS dictation:', err);
+        setErrorMessage('මයික්‍රෆෝනය සක්‍රීය කිරීමට නොහැකි විය. (Failed to capture input audio device.)');
+        setMicState('error');
+      }
+    } else {
+      startListeningNonIOS();
+    }
+  };
+
+  const startRecordingAi = async () => {
+    setErrorMessage(null);
+    setInterimText('');
+    aiChunksRef.current = [];
+    
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setMediaStream(stream);
+
+      // Determine supported MIME type for MediaRecorder inside browser
+      let options = {};
+      let mimeType = 'audio/webm';
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        options = { mimeType: 'audio/webm;codecs=opus' };
+        mimeType = 'audio/webm';
+      } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+        options = { mimeType: 'audio/webm' };
+        mimeType = 'audio/webm';
+      } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+        options = { mimeType: 'audio/mp4' };
+        mimeType = 'audio/mp4';
+      } else if (MediaRecorder.isTypeSupported('audio/aac')) {
+        options = { mimeType: 'audio/aac' };
+        mimeType = 'audio/aac';
+      }
+
+      const recorder = new MediaRecorder(stream, options);
+      
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          aiChunksRef.current.push(e.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        setIsListening(false);
+        setIsRecordingAi(false);
+        setMicState('idle');
+        
+        // Stop all track devices to clear microphone red light icon
+        stream.getTracks().forEach(t => t.stop());
+        setMediaStream(null);
+
+        if (aiChunksRef.current.length === 0) {
+          console.warn('No recorded chunks available');
+          return;
+        }
+
+        const audioBlob = new Blob(aiChunksRef.current, { type: recorder.mimeType || mimeType });
+        await handleAudioTranscribe(audioBlob, mimeType);
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start(250); // Slice input audio chunk every 250ms securely
+      setIsListening(true);
+      setIsRecordingAi(true);
+      setMicState('listening');
+    } catch (err: any) {
+      console.error('Failed to start AI mic recording:', err);
+      setErrorMessage('මයික්‍රෆෝනය සක්‍රීය කිරීමට නොහැකි විය. (Failed to access microphone for recording.)');
+      setMicState('error');
+    }
+  };
+
+  const stopRecordingAi = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (err) {
+        console.warn('Failed to stop MediaRecorder:', err);
+      }
+    }
+  };
+
+  const handleAudioTranscribe = async (blob: Blob, mimeType: string) => {
+    setAiTranscribingStatus(true);
+    setErrorMessage(null);
+    
+    try {
+      const reader = new FileReader();
+      reader.readAsDataURL(blob);
+      reader.onloadend = async () => {
+        const base64data = reader.result as string;
+        
+        try {
+          const response = await fetch('/api/gemini/audio-transcribe', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              audio: base64data,
+              mimeType: blob.type || mimeType
+            })
+          });
+
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.error || 'Transcription failed');
+          }
+
+          if (data.result && data.result.trim()) {
+            handleInsertTextAtCursor(data.result);
+            
+            // If Auto Stop & Copy is active, copy the newly updated full text
+            if (autoStopAndCopy) {
+              const updatedText = (textareaRef.current?.value || '') + ' ' + data.result;
+              navigator.clipboard.writeText(updatedText.trim())
+                .then(() => {
+                  setCopyStatus(true);
+                  setTimeout(() => setCopyStatus(false), 2500);
+                })
+                .catch(err => console.warn('Auto-clipboard copy blocked or failed:', err));
+            }
+          } else {
+            setErrorMessage('පටිගත කරන ලද හඬ හඳුනාගැනීමට නොහැකි විය. කරුණාකර වඩා පැහැදිලිව නැවත කථා කරන්න. (No voice detected or could not recognize text.)');
+          }
+        } catch (postErr: any) {
+          console.error('Failed to post audio to Gemini API:', postErr);
+          setErrorMessage(`AI හඬ හඳුනාගැනීම අසාර්ථක විය: ${postErr.message || 'Server error'}`);
+        } finally {
+          setAiTranscribingStatus(false);
+        }
+      };
+    } catch (err: any) {
+      console.error('Error preparing audio file conversion:', err);
+      setErrorMessage('පටිගත කරන ලද හඬ ගොනුව සකස් කිරීම අසාර්ථක විය. (Failed to convert recorded audio blob.)');
+      setAiTranscribingStatus(false);
+    }
+  };
+
   const stopListening = () => {
+    if (dictationMode === 'ai') {
+      stopRecordingAi();
+      return;
+    }
     if (silenceTimeoutRef.current) {
       clearTimeout(silenceTimeoutRef.current);
       silenceTimeoutRef.current = null;
@@ -262,6 +507,15 @@ export default function App() {
   };
 
   const toggleListening = () => {
+    if (dictationMode === 'ai') {
+      if (isListening || isRecordingAi) {
+        stopRecordingAi();
+      } else {
+        startRecordingAi();
+      }
+      return;
+    }
+
     if (isListening) {
       stopListening();
     } else {
@@ -501,19 +755,67 @@ export default function App() {
         <section className="lg:col-span-7 space-y-4">
           <div className="bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-850 rounded-3xl p-5 shadow-sm space-y-4">
             
+            {/* Dictation Mode Selector */}
+            <div className="flex bg-slate-100 dark:bg-slate-800/60 p-1 rounded-xl w-full border border-slate-200/20">
+              <button
+                type="button"
+                onClick={() => {
+                  stopListening();
+                  setDictationMode('web');
+                }}
+                className={`flex-1 flex items-center justify-center gap-2 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                  dictationMode === 'web'
+                    ? 'bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-100 shadow-sm'
+                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'
+                }`}
+              >
+                <Mic className="w-3.5 h-3.5" />
+                <span>වෙබ් Streaming (Web Mode)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  stopListening();
+                  setDictationMode('ai');
+                }}
+                className={`flex-1 flex items-center justify-center gap-2 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                  dictationMode === 'ai'
+                    ? 'bg-rose-500 text-white shadow-sm font-bold'
+                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span className="flex items-center gap-1">
+                  AI Dictate
+                  <span className="bg-red-500/90 text-[8px] text-white px-1.5 py-0.2 rounded-full uppercase tracking-tighter shrink-0 animate-pulse border border-red-400/30">iOS Fix ✓</span>
+                </span>
+              </button>
+            </div>
+
             {/* 1. Indicator strip & Visualizer */}
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <div className="flex items-center gap-2.5">
-                <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold ${
-                  isListening 
-                    ? 'bg-rose-50 text-rose-600 dark:bg-rose-950/30 dark:text-rose-400 border border-rose-100/50' 
-                    : micState === 'error'
-                    ? 'bg-amber-50 text-amber-600'
-                    : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
-                }`}>
-                  <span className={`h-2 h-2 w-2 rounded-full ${isListening ? 'bg-rose-500 animate-ping' : 'bg-slate-400'}`} />
-                  {isListening ? `Live Recording (${formatTimer(durationSec)})` : 'Ready to listen'}
-                </span>
+                {aiTranscribingStatus ? (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-600 dark:bg-indigo-950/30 dark:text-indigo-400 border border-indigo-200/50">
+                    <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce" />
+                    හඬ හඳුනාගනිමින් පවතී... (AI Transcribing...)
+                  </span>
+                ) : (
+                  <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold ${
+                    isListening 
+                      ? 'bg-rose-50 text-rose-600 dark:bg-rose-950/30 dark:text-rose-400 border border-rose-100/50' 
+                      : micState === 'error'
+                      ? 'bg-amber-50 text-amber-600'
+                      : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
+                  }`}>
+                    <span className={`h-2 h-2 w-2 rounded-full ${isListening ? 'bg-rose-500 animate-ping' : 'bg-slate-400'}`} />
+                    {isListening 
+                      ? (dictationMode === 'ai' 
+                        ? `AI Recording (${formatTimer(durationSec)}) - කථා කරන්න` 
+                        : `Live Streaming (${formatTimer(durationSec)})`) 
+                      : 'හඬ පටිගත කිරීමට සූදානම් (Ready to listen)'}
+                  </span>
+                )}
 
                 {activeNoteTitle && (
                   <span className="text-xs font-semibold max-w-[160px] truncate text-slate-400 flex items-center gap-1">
@@ -544,21 +846,30 @@ export default function App() {
                   id="btn-trigger-voice-dictation"
                   onClick={toggleListening}
                   className={`px-3 py-1.5 rounded-lg font-bold shadow-sm transition-all flex items-center gap-1.5 text-[11px] md:text-xs cursor-pointer ${
-                    isListening
+                    aiTranscribingStatus
+                      ? 'bg-indigo-300 dark:bg-indigo-950/80 text-white cursor-wait'
+                      : isListening
                       ? 'bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-750 text-white shadow-rose-500/20 hover:scale-[1.01] active:scale-99'
+                      : dictationMode === 'ai'
+                      ? 'bg-gradient-to-r from-rose-500 to-rose-600 hover:from-rose-600 hover:to-rose-700 text-white shadow-rose-500/20 hover:scale-[1.01] active:scale-99'
                       : 'bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-600 hover:to-indigo-750 text-white shadow-indigo-600/20 hover:scale-[1.01] active:scale-99'
                   }`}
-                  disabled={!isSpeechSupported}
+                  disabled={aiTranscribingStatus || (dictationMode === 'web' && !isSpeechSupported)}
                 >
-                  {isListening ? (
+                  {aiTranscribingStatus ? (
+                    <>
+                      <div className="h-3.5 w-3.5 border-2 border-slate-100 border-t-transparent rounded-full animate-spin shrink-0" />
+                      <span>Transcribing...</span>
+                    </>
+                  ) : isListening ? (
                     <>
                       <MicOff className="w-3.5 h-3.5 animate-pulse shrink-0" />
-                      <span>Stop</span>
+                      <span>{dictationMode === 'ai' ? 'Stop & Write' : 'Stop'}</span>
                     </>
                   ) : (
                     <>
                       <Mic className="w-3.5 h-3.5 shrink-0" />
-                      <span>Dictate</span>
+                      <span>{dictationMode === 'ai' ? 'පටිගත කරන්න (Record)' : 'Dictate'}</span>
                     </>
                   )}
                 </button>
@@ -589,7 +900,7 @@ export default function App() {
 
             {/* 2. Text Editor Draft canvas */}
             <div className="relative">
-              {!isSpeechSupported && (
+              {!isSpeechSupported && dictationMode === 'web' && (
                 <div className="absolute inset-0 bg-slate-50/90 dark:bg-slate-900/90 backdrop-blur-[2px] z-10 flex flex-col items-center justify-center p-6 text-center border-2 border-dashed border-red-200/50 rounded-2xl">
                   <AlertTriangle className="w-11 h-11 text-amber-500 mb-3" />
                   <h4 className="font-semibold text-slate-800 dark:text-slate-200 text-sm">
